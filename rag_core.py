@@ -197,8 +197,7 @@ def render_page(doc_id: str, page: int, highlight: str | None = None, zoom: floa
     with fitz.open(PDF_DIR / f"{doc_id}.pdf") as doc:
         p = doc[page - 1]
         if highlight:
-            # Highlight sentence by sentence; fall back to the first words if
-            # cleaning changed the text enough that the full sentence isn't found.
+            # Highlight sentence by sentence; fall back to the first words if cleaning changed the text enough that the full sentence isn't found.
             for sent in re.split(r"(?<=[.!?])\s+", highlight):
                 if len(sent) < 15:
                     continue
@@ -239,7 +238,7 @@ PROVIDERS = {
 }
 GROQ_URL = "https://api.groq.com/openai/v1"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
-OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 if not OLLAMA_URL.startswith("http"):
     OLLAMA_URL = f"http://{OLLAMA_URL}"
 

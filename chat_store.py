@@ -17,6 +17,7 @@ class Message:
     role: str
     content: str
     sources: list[dict] | None = None
+    attachments: list[str] | None = None   # filenames attached with this message
 
 
 @dataclass
@@ -57,6 +58,10 @@ class ChatStore:
             CREATE INDEX IF NOT EXISTS idx_messages_conv
                 ON messages(conversation_id, id);
         """)
+        # Older databases don't have the attachments column yet.
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(messages)")}
+        if "attachments" not in cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT")
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.commit()
 
@@ -108,6 +113,7 @@ class ChatStore:
                 role=m["role"],
                 content=m["content"],
                 sources=json.loads(m["sources"]) if m["sources"] else None,
+                attachments=json.loads(m["attachments"]) if m["attachments"] else None,
             )
             for m in msg_rows
         ]
@@ -127,6 +133,17 @@ class ChatStore:
         )
         self.conn.commit()
 
+    def get_doc_ids(self, conv_id: str) -> list[str]:
+        row = self.conn.execute(
+            "SELECT doc_ids FROM conversations WHERE id = ?", (conv_id,)
+        ).fetchone()
+        return json.loads(row["doc_ids"]) if row else []
+
+    def doc_in_use(self, doc_id: str) -> bool:
+        # True if any conversation still has this PDF attached.
+        return any(doc_id in json.loads(r["doc_ids"])
+                   for r in self.conn.execute("SELECT doc_ids FROM conversations"))
+
     def delete_conversation(self, conv_id: str):
         self.conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
         self.conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
@@ -134,12 +151,14 @@ class ChatStore:
 
     # Messages
     def add_message(self, conv_id: str, role: str, content: str,
-                    sources: list[dict] | None = None):
+                    sources: list[dict] | None = None,
+                    attachments: list[str] | None = None):
         self.conn.execute(
-            "INSERT INTO messages (conversation_id, role, content, sources, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO messages (conversation_id, role, content, sources, attachments, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (conv_id, role, content,
-             json.dumps(sources) if sources else None, _now()),
+             json.dumps(sources) if sources else None,
+             json.dumps(attachments) if attachments else None, _now()),
         )
         self.conn.execute(
             "UPDATE conversations SET updated_at = ? WHERE id = ?",

@@ -10,7 +10,6 @@ st.set_page_config(page_title="Chat with your PDFs", page_icon="📄", layout="w
 
 
 def _secret(name: str) -> str | None:
-    """Read from .streamlit/secrets.toml (used when deployed), if present."""
     try:
         return st.secrets.get(name)
     except Exception:
@@ -20,6 +19,20 @@ def _secret(name: str) -> str | None:
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_models(provider: str, api_key: str) -> list[str]:
     return list_models(provider, api_key)
+
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_ollama_running() -> bool:
+    return ollama_running()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_ollama_models() -> list[str]:
+    return list_models("Ollama", "")
+
+
+@st.cache_data(show_spinner=False)
+def cached_page(doc_id: str, page: int, highlight: str) -> bytes:
+    return render_page(doc_id, page, highlight=highlight)
 
 
 @st.cache_resource(show_spinner="Loading embedding model…")
@@ -36,61 +49,102 @@ index = get_index()
 store = get_store()
 
 
-# ── Session-state init ──────────────────────────────────────────────────
+# Session-state init
 def _init_state():
-    if "conv_id" not in st.session_state:
-        st.session_state.conv_id = None
-    if "messages" not in st.session_state:
-        st.session_state.messages = []     # [{role, content, sources?}]
-    if "search_query" not in st.session_state:
-        st.session_state.search_query = ""
+    st.session_state.setdefault("conv_id", None)
+    st.session_state.setdefault("messages", [])     # [{role, content, sources?, attachments?}]
+    st.session_state.setdefault("chat_docs", [])    # doc_ids attached to the current chat
+    st.session_state.setdefault("search_query", "")
 
 _init_state()
 
 
-# ── Chat management helpers ─────────────────────────────────────────────
+# Chat management helpers
 def _load_conversation(conv_id: str):
-    """Switch to an existing conversation."""
+    # Switch to an existing conversation.
     conv = store.get_conversation(conv_id)
     if not conv:
         return
     st.session_state.conv_id = conv.id
     st.session_state.messages = [
-        {"role": m.role, "content": m.content, "sources": m.sources}
+        {"role": m.role, "content": m.content, "sources": m.sources,
+         "attachments": m.attachments}
         for m in conv.messages
     ]
-    # Restore the document selections for this conversation
-    saved_docs = set(conv.doc_ids or [])
-    for d_id in index.documents():
-        st.session_state[f"sel-{d_id}"] = (d_id in saved_docs) if saved_docs else True
+    known = index.documents()
+    st.session_state.chat_docs = [d for d in conv.doc_ids if d in known]
+    st.session_state.lib_pick = []
 
 
 def _new_chat():
-    """Start a fresh conversation."""
+    # Start a fresh conversation. 
     st.session_state.conv_id = None
     st.session_state.messages = []
-    for d_id in index.documents():
-        st.session_state[f"sel-{d_id}"] = True
+    st.session_state.chat_docs = []
+    st.session_state.lib_pick = []
 
 
-def _ensure_conversation() -> str:
-    """Create a DB conversation if one doesn't exist yet (lazy creation on
-    first message, so empty 'New chat' windows don't litter the history)."""
+def _ensure_conversation(title: str = "New chat") -> str:
+    # Create a DB conversation if one doesn't exist yet (lazy creation on first message/attachment, so empty 'New chat' windows don't litter the history).
     if st.session_state.conv_id is None:
-        conv_id = store.create_conversation()
-        st.session_state.conv_id = conv_id
+        st.session_state.conv_id = store.create_conversation(title=auto_title(title))
     return st.session_state.conv_id
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────
+def _cleanup_docs(doc_ids: list[str]):
+    # Delete PDFs (file + chunks) that no chat uses anymore.
+    for d in doc_ids:
+        if not store.doc_in_use(d):
+            index.remove_pdf(d)
+
+
+def _link_docs(doc_ids: list[str], title_hint: str):
+    # Attach already-indexed PDFs to the current chat.
+    new = [d for d in doc_ids if d not in st.session_state.chat_docs]
+    if not new:
+        return
+    conv_id = _ensure_conversation(title_hint)
+    st.session_state.chat_docs = st.session_state.chat_docs + new
+    store.update_doc_ids(conv_id, st.session_state.chat_docs)
+
+
+def _unlink_doc(doc_id: str):
+    # Remove a PDF from the current chat; delete it if no other chat uses it.
+    st.session_state.chat_docs = [d for d in st.session_state.chat_docs if d != doc_id]
+    if st.session_state.conv_id:
+        store.update_doc_ids(st.session_state.conv_id, st.session_state.chat_docs)
+    _cleanup_docs([doc_id])
+
+
+def _add_from_library():
+    picked = st.session_state.get("lib_pick") or []
+    if picked:
+        _link_docs(picked, title_hint=index.documents().get(picked[0], "New chat"))
+    st.session_state.lib_pick = []
+
+
+def _delete_conversation(conv_id: str):
+    doc_ids = store.get_doc_ids(conv_id)
+    store.delete_conversation(conv_id)
+    if st.session_state.conv_id == conv_id:
+        _new_chat()
+    _cleanup_docs(doc_ids)
+
+
+def _clear_chat():
+    # Clear the messages but keep the chat and its documents.
+    if st.session_state.conv_id:
+        store.clear_messages(st.session_state.conv_id)
+    st.session_state.messages = []
+
+
+# Sidebar 
 with st.sidebar:
-    # ── Chat history section ────────────────────────────────────────────
+    # Chat history section 
     st.header("💬 Chats")
 
     # New chat button
-    if st.button("➕  New chat", use_container_width=True, type="primary"):
-        _new_chat()
-        st.rerun()
+    st.button("➕  New chat", use_container_width=True, type="primary", on_click=_new_chat)
 
     # Search bar
     search_q = st.text_input(
@@ -107,51 +161,44 @@ with st.sidebar:
             col1, col2 = st.columns([5, 1])
             is_active = conv.id == st.session_state.conv_id
             label = f"**{conv.title}**" if is_active else conv.title
-            if col1.button(label, key=f"conv-{conv.id}", use_container_width=True,
-                           disabled=is_active):
-                _load_conversation(conv.id)
-                st.rerun()
-            if col2.button("🗑", key=f"del-conv-{conv.id}", help=f"Delete '{conv.title}'"):
-                store.delete_conversation(conv.id)
-                if st.session_state.conv_id == conv.id:
-                    _new_chat()
-                st.rerun()
+            col1.button(label, key=f"conv-{conv.id}", use_container_width=True,
+                        disabled=is_active, on_click=_load_conversation, args=(conv.id,))
+            col2.button("🗑", key=f"del-conv-{conv.id}", help=f"Delete '{conv.title}'",
+                        on_click=_delete_conversation, args=(conv.id,))
     elif search_q:
         st.caption("No chats match your search.")
 
     st.divider()
 
-    # ── Documents section ───────────────────────────────────────────────
-    st.header("📚 Documents")
-    uploads = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
-    if uploads and st.button("Index uploaded files", type="primary", use_container_width=True):
-        for f in uploads:
-            with st.spinner(f"Indexing {f.name}…"):
-                try:
-                    _, n = index.add_pdf(f.name, f.getvalue())
-                    st.success(f"{f.name}: {n} chunks" if n else f"{f.name}: already indexed")
-                except Exception as e:
-                    st.error(f"{f.name}: {e}")
-
-    docs = index.documents()
-    selected = []
-    if docs:
-        st.caption("Search in:")
-        for doc_id, name in docs.items():
+    # Documents in this chat
+    st.header("📎 Documents")
+    docs = index.documents()                       # whole library: doc_id -> filename
+    chat_docs = [d for d in st.session_state.chat_docs if d in docs]
+    if chat_docs:
+        for doc_id in chat_docs:
             c1, c2 = st.columns([5, 1])
-            if c1.checkbox(name, value=True, key=f"sel-{doc_id}"):
-                selected.append(doc_id)
-            if c2.button("🗑", key=f"del-{doc_id}", help=f"Remove {name}"):
-                index.remove_pdf(doc_id)
-                st.rerun()
+            c1.markdown(f"📄 {docs[doc_id]}")
+            c2.button("✕", key=f"unlink-{doc_id}",
+                      help="Remove from this chat (deleted if no other chat uses it)",
+                      on_click=_unlink_doc, args=(doc_id,))
     else:
-        st.info("No documents yet. Upload a PDF to start.")
+        st.caption("No PDFs in this chat yet. Attach some with the 📎 in the chat box.")
+
+    others = {d: n for d, n in docs.items() if d not in chat_docs}
+    if others:
+        with st.expander("Add from library"):
+            st.multiselect("PDFs", list(others), format_func=others.get, key="lib_pick",
+                           label_visibility="collapsed",
+                           placeholder="PDFs uploaded in other chats")
+            st.button("Add to this chat", use_container_width=True,
+                      on_click=_add_from_library,
+                      disabled=not st.session_state.get("lib_pick"))
 
     st.divider()
 
     # Settings section
     st.header("⚙️ Settings")
-    local = ollama_running()
+    local = cached_ollama_running()
     provider = st.radio("Free LLM", list(PROVIDERS), horizontal=True,
                         index=0 if local else 1,
                         help="Ollama runs on your computer (private, unlimited). "
@@ -159,7 +206,7 @@ with st.sidebar:
     info = PROVIDERS[provider]
     api_key = None
     if provider == "Ollama":
-        models = list_models("Ollama", "") if local else []
+        models = cached_ollama_models() if local else []
         if not local:
             st.warning("Ollama isn't running. [Install it](https://ollama.com/download), "
                        "run `ollama pull llama3.2`, then reload this page.")
@@ -175,17 +222,13 @@ with st.sidebar:
     model = st.selectbox("Model", models or info["default_models"])
     top_k = st.slider("Passages to retrieve (k)", 2, 10, 5)
     hybrid = st.toggle("Hybrid search (keywords + embeddings)", value=True)
-    if st.button("Clear chat", use_container_width=True,
-                 help="Clear all messages in this chat"):
-        if st.session_state.conv_id:
-            store.clear_messages(st.session_state.conv_id)
-        st.session_state.messages = []
-        st.rerun()
+    st.button("Clear chat", use_container_width=True,
+              help="Clear all messages in this chat", on_click=_clear_chat)
 
 
 # Sources panel
 def show_sources(sources: list[dict], answer: str):
-    """Cited passages first, each expandable to the exact text and the highlighted page."""
+    # Cited passages first, each expandable to the exact text and the highlighted page.
     cited = set(cited_numbers(answer))
     order = sorted(range(len(sources)), key=lambda i: (i + 1) not in cited)
     with st.expander(f"📎 Sources ({len(cited)} cited, {len(sources)} retrieved)"):
@@ -199,7 +242,7 @@ def show_sources(sources: list[dict], answer: str):
             st.caption(s["text"])
             if st.toggle("Show page", key=f"pg-{s['id']}-{id(sources)}-{n}"):
                 try:
-                    st.image(render_page(s["doc_id"], s["page"], highlight=s["text"]))
+                    st.image(cached_page(s["doc_id"], s["page"], s["text"]))
                 except Exception as e:
                     st.error(f"Could not render page: {e}")
             st.divider()
@@ -207,47 +250,87 @@ def show_sources(sources: list[dict], answer: str):
 
 # Chat
 st.title("📄 Chat with your PDFs")
-st.caption("Answers come only from your documents, with page citations like [1].")
+st.caption("Attach PDFs with 📎 and ask questions. Answers come only from this chat's documents, "
+           "with page citations like [1].")
+
+
+def show_user_message(content: str, attachments: list[str] | None):
+    if content:
+        st.markdown(content)
+    if attachments:
+        st.caption("📎 " + ", ".join(attachments))
+
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg.get("sources"):
-            show_sources(msg["sources"], msg["content"])
-
-if question := st.chat_input("Ask a question about your documents…", disabled=not docs):
-    history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    with st.chat_message("assistant"):
-        chunks = index.search(retrieval_query(question, history), k=top_k,
-                              doc_ids=selected or None, hybrid=hybrid)
-        if not chunks:
-            answer = "No passages found. Select at least one document in the sidebar."
-            st.markdown(answer)
+        if msg["role"] == "user":
+            show_user_message(msg["content"], msg.get("attachments"))
         else:
-            answer = st.write_stream(stream_answer(provider, model, api_key, question, chunks, history))
-        sources = [c.__dict__ for c in chunks]
-        if chunks:
-            show_sources(sources, answer)
+            st.markdown(msg["content"])
+            if msg.get("sources"):
+                show_sources(msg["sources"], msg["content"])
+
+prompt = st.chat_input("Ask a question, or attach PDFs with 📎",
+                       accept_file="multiple", file_type=["pdf"])
+if prompt:
+    question = (prompt.text or "").strip()
+    files = prompt.files or []
+    # Attachment-only messages have no text, so they're left out of the LLM history.
+    history = [{"role": m["role"], "content": m["content"]}
+               for m in st.session_state.messages if m["content"]]
+    first_question = not any(m["role"] == "user" and m["content"]
+                             for m in st.session_state.messages)
+    was_new_chat = st.session_state.conv_id is None
+
+    # Index attachments and link them to this chat
+    attached = []
+    with st.chat_message("user"):
+        if question:
+            st.markdown(question)
+        for f in files:
+            with st.spinner(f"Indexing {f.name}…"):
+                try:
+                    doc_id, _ = index.add_pdf(f.name, f.getvalue())
+                    _link_docs([doc_id], title_hint=f.name)
+                    attached.append(f.name)
+                except Exception as e:
+                    st.error(f"{f.name}: {e}")
+        if attached:
+            st.caption("📎 " + ", ".join(attached))
+
+    chat_docs = st.session_state.chat_docs
+    answer, sources = None, None
+    if question and not chat_docs:
+        # Nothing to search: show a hint but don't save anything.
+        with st.chat_message("assistant"):
+            st.info("This chat has no PDFs yet. Attach one with the 📎 in the chat box, "
+                    "or add one from the library in the sidebar.")
+    elif question:
+        with st.chat_message("assistant"):
+            chunks = index.search(retrieval_query(question, history), k=top_k,
+                                  doc_ids=chat_docs, hybrid=hybrid)
+            if not chunks:
+                answer = "No passages found in this chat's documents."
+                st.markdown(answer)
+            else:
+                answer = st.write_stream(stream_answer(provider, model, api_key,
+                                                       question, chunks, history))
+                sources = [c.__dict__ for c in chunks]
+                show_sources(sources, answer)
 
     # Persist to chat history
-    conv_id = _ensure_conversation()
+    if answer is not None or attached:
+        conv_id = _ensure_conversation(question or attached[0])
+        if answer is not None and first_question:
+            store.update_title(conv_id, auto_title(question))   # title = first question
+        store.add_message(conv_id, "user", question, attachments=attached or None)
+        st.session_state.messages.append(
+            {"role": "user", "content": question, "attachments": attached or None})
+        if answer is not None:
+            store.add_message(conv_id, "assistant", answer, sources=sources)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer, "sources": sources})
 
-    # Auto-title from first user question
-    if not history:
-        store.update_title(conv_id, auto_title(question))
-
-    # Save the selected documents
-    store.update_doc_ids(conv_id, selected)
-
-    # Save both messages
-    store.add_message(conv_id, "user", question)
-    store.add_message(conv_id, "assistant", answer,
-                      sources=sources if chunks else None)
-
-    st.session_state.messages += [
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": answer, "sources": sources if chunks else None},
-    ]
+        # The sidebar was drawn before this; refresh it so the new chat / PDFs show up.
+        if was_new_chat or attached:
+            st.rerun()

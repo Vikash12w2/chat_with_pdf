@@ -47,13 +47,24 @@ streamlit run app.py
 
 Opens at http://localhost:8501.
 
-1. Upload PDFs in the sidebar → **Index uploaded files**.
-2. Ask questions in the chat.
+1. Attach PDFs with the 📎 in the chat box (with or without a question).
+2. Ask questions. Only the PDFs attached to the current chat are searched.
 3. Expand **Sources** under an answer to see the passages; **Show page** renders the page with the passage highlighted.
 
-Quick test: index `samples/handbook.pdf` and ask "Which form do I use to request equipment?"
+Quick test: attach `samples/handbook.pdf` and ask "Which form do I use to request equipment?"
 
-Sidebar also has: tick/untick which docs to search, delete a doc, model picker, `k` (passages retrieved, default 5), hybrid search toggle, clear chat.
+Settings in the sidebar: LLM provider/model, `k` (passages retrieved, default 5), hybrid search toggle, clear chat.
+
+### Chats and documents
+
+Each chat has its own PDFs; behind that there's one shared index (the "library").
+
+- Attaching a PDF indexes it and links it to the current chat. If it's already in the library (same file bytes, even under a different name), it's linked instantly without re-embedding, and keeps its original name.
+- **Add from library** in the sidebar links a PDF that was uploaded in another chat.
+- ✕ next to a PDF removes it from the chat. If no other chat uses it, it's deleted from the library too (file + chunks). Same when deleting a chat.
+- Chats are saved in SQLite (`data/chat_history.db`, see `chat_store.py`) with their messages, sources and attached PDFs. A chat is only saved once something is attached or asked, so empty "New chat"s don't pile up.
+- Title is the first question (cut to 50 chars), or the first PDF's name until a question is asked.
+- Search box filters chats by title or message text. **Clear chat** empties the messages but keeps the chat and its PDFs.
 
 ## How it works
 
@@ -77,7 +88,7 @@ Sidebar also has: tick/untick which docs to search, delete a doc, model picker, 
 {"question": "Which form do I use to request equipment?", "pdf": "handbook.pdf", "pages": [2]}
 ```
 
-It reads the existing index, so **index the PDFs in the app first**, then:
+It reads the existing index, so **attach the PDFs in a chat first** (and keep that chat, since deleting it removes PDFs no other chat uses), then:
 
 ```bash
 python evaluate.py samples/eval_set.json --k 5
@@ -89,11 +100,15 @@ Prints hit@k (correct page anywhere in top k) and MRR (how high the first correc
 
 ```
 app.py                 Streamlit UI
-rag_core.py            everything else: extraction, cleaning, chunking, index, search, LLM calls
+rag_core.py            extraction, cleaning, chunking, index, search, LLM calls
+chat_store.py          chats, messages and per-chat PDFs (SQLite)
 evaluate.py            retrieval eval (hit@k, MRR)
 samples/               handbook.pdf + eval_set.json
 .streamlit/            secrets.toml.example
-data/                  created at runtime: chroma/ (vector DB) and pdfs/ (stored copies), gitignored
+data/                  created at runtime, gitignored:
+  chroma/              vector DB
+  pdfs/                stored copies of uploaded PDFs
+  chat_history.db      saved chats
 ```
 
 ## Things to tweak
@@ -108,10 +123,11 @@ Top of `rag_core.py`:
 
 Default model lists per provider are in `PROVIDERS`; the system prompt is `SYSTEM_PROMPT`.
 
-**After changing chunking or the embedding model, delete `data/` and re-index.** Deleting `data/` is also how to reset everything.
+**After changing chunking or the embedding model, delete `data/` and re-attach the PDFs.** (Chats are in `data/` too. To keep them, delete only `chroma/` and `pdfs/` and re-upload the same files; they get the same IDs, so old chats pick them up again.) Deleting `data/` resets everything.
 
 ## Notes
 
+- Needs Streamlit 1.43+ for file attachments in the chat box (`pip install -U streamlit`).
 - Ollama only works when running locally. On a deployed version (e.g. Streamlit Cloud), use Groq or Gemini with keys in secrets.
 - With Groq/Gemini, the retrieved passages (not the whole PDF) are sent to the provider.
 - Free-tier rate limits (429) show up as a message in the chat; wait or switch model/provider.
