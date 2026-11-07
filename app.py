@@ -2,6 +2,7 @@ import os
 
 import streamlit as st
 
+from chat_store import ChatStore, auto_title
 from rag_core import (PROVIDERS, RAGIndex, cited_numbers, list_models, ollama_running,
                       render_page, retrieval_query, stream_answer)
 
@@ -26,11 +27,101 @@ def get_index() -> RAGIndex:
     return RAGIndex()
 
 
-index = get_index()
-st.session_state.setdefault("messages", [])   # [{role, content, sources?}]
+@st.cache_resource
+def get_store() -> ChatStore:
+    return ChatStore()
 
-# Sidebar
+
+index = get_index()
+store = get_store()
+
+
+# ── Session-state init ──────────────────────────────────────────────────
+def _init_state():
+    if "conv_id" not in st.session_state:
+        st.session_state.conv_id = None
+    if "messages" not in st.session_state:
+        st.session_state.messages = []     # [{role, content, sources?}]
+    if "search_query" not in st.session_state:
+        st.session_state.search_query = ""
+
+_init_state()
+
+
+# ── Chat management helpers ─────────────────────────────────────────────
+def _load_conversation(conv_id: str):
+    """Switch to an existing conversation."""
+    conv = store.get_conversation(conv_id)
+    if not conv:
+        return
+    st.session_state.conv_id = conv.id
+    st.session_state.messages = [
+        {"role": m.role, "content": m.content, "sources": m.sources}
+        for m in conv.messages
+    ]
+    # Restore the document selections for this conversation
+    saved_docs = set(conv.doc_ids or [])
+    for d_id in index.documents():
+        st.session_state[f"sel-{d_id}"] = (d_id in saved_docs) if saved_docs else True
+
+
+def _new_chat():
+    """Start a fresh conversation."""
+    st.session_state.conv_id = None
+    st.session_state.messages = []
+    for d_id in index.documents():
+        st.session_state[f"sel-{d_id}"] = True
+
+
+def _ensure_conversation() -> str:
+    """Create a DB conversation if one doesn't exist yet (lazy creation on
+    first message, so empty 'New chat' windows don't litter the history)."""
+    if st.session_state.conv_id is None:
+        conv_id = store.create_conversation()
+        st.session_state.conv_id = conv_id
+    return st.session_state.conv_id
+
+
+# ── Sidebar ──────────────────────────────────────────────────────────────
 with st.sidebar:
+    # ── Chat history section ────────────────────────────────────────────
+    st.header("💬 Chats")
+
+    # New chat button
+    if st.button("➕  New chat", use_container_width=True, type="primary"):
+        _new_chat()
+        st.rerun()
+
+    # Search bar
+    search_q = st.text_input(
+        "Search chats…", value=st.session_state.search_query,
+        key="chat_search_input", label_visibility="collapsed",
+        placeholder="🔍 Search chats…",
+    )
+    st.session_state.search_query = search_q
+
+    # Chat list
+    convos = store.list_conversations(search=search_q or None)
+    if convos:
+        for conv in convos:
+            col1, col2 = st.columns([5, 1])
+            is_active = conv.id == st.session_state.conv_id
+            label = f"**{conv.title}**" if is_active else conv.title
+            if col1.button(label, key=f"conv-{conv.id}", use_container_width=True,
+                           disabled=is_active):
+                _load_conversation(conv.id)
+                st.rerun()
+            if col2.button("🗑", key=f"del-conv-{conv.id}", help=f"Delete '{conv.title}'"):
+                store.delete_conversation(conv.id)
+                if st.session_state.conv_id == conv.id:
+                    _new_chat()
+                st.rerun()
+    elif search_q:
+        st.caption("No chats match your search.")
+
+    st.divider()
+
+    # ── Documents section ───────────────────────────────────────────────
     st.header("📚 Documents")
     uploads = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
     if uploads and st.button("Index uploaded files", type="primary", use_container_width=True):
@@ -57,6 +148,8 @@ with st.sidebar:
         st.info("No documents yet. Upload a PDF to start.")
 
     st.divider()
+
+    # Settings section
     st.header("⚙️ Settings")
     local = ollama_running()
     provider = st.radio("Free LLM", list(PROVIDERS), horizontal=True,
@@ -82,7 +175,10 @@ with st.sidebar:
     model = st.selectbox("Model", models or info["default_models"])
     top_k = st.slider("Passages to retrieve (k)", 2, 10, 5)
     hybrid = st.toggle("Hybrid search (keywords + embeddings)", value=True)
-    if st.button("Clear chat", use_container_width=True):
+    if st.button("Clear chat", use_container_width=True,
+                 help="Clear all messages in this chat"):
+        if st.session_state.conv_id:
+            store.clear_messages(st.session_state.conv_id)
         st.session_state.messages = []
         st.rerun()
 
@@ -135,6 +231,21 @@ if question := st.chat_input("Ask a question about your documents…", disabled=
         sources = [c.__dict__ for c in chunks]
         if chunks:
             show_sources(sources, answer)
+
+    # Persist to chat history
+    conv_id = _ensure_conversation()
+
+    # Auto-title from first user question
+    if not history:
+        store.update_title(conv_id, auto_title(question))
+
+    # Save the selected documents
+    store.update_doc_ids(conv_id, selected)
+
+    # Save both messages
+    store.add_message(conv_id, "user", question)
+    store.add_message(conv_id, "assistant", answer,
+                      sources=sources if chunks else None)
 
     st.session_state.messages += [
         {"role": "user", "content": question},
